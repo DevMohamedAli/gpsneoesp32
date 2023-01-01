@@ -1,0 +1,285 @@
+#include <Arduino.h>
+#include <TinyGPS++.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <MQTT.h>
+#include <ArduinoJson.h> // tago io
+
+//
+auto &debug_ser = Serial;
+auto &sim800_serial = Serial1;
+auto &gps_serial = Serial2; // TX=0, RX=15
+constexpr int gps_rx_pin = 15;
+constexpr int gps_tx_pin = 0;
+
+// GPS PART
+TinyGPSPlus gps;
+bool first_time_read_flag = false;
+float lat_gps = 0;
+float lng_gps = 0;
+
+// GSM PART
+#define MODEM_RST 5
+#define MODEM_PWRKEY 4
+#define MODEM_POWER_ON 23
+#define MODEM_TX 27
+#define MODEM_RX 26
+
+#define MODEM_DTR 32
+#define MODEM_RI 33
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define LED_GPIO 13
+#define LED_ON HIGH
+#define LED_OFF LOW
+
+#define IP5306_ADDR 0x75
+#define IP5306_REG_SYS_CTL0 0x00
+
+#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_RX_BUFFER 1024
+
+#include <TinyGsmClient.h>
+static TinyGsm sim800_modem(sim800_serial);
+
+static TinyGsmClient gsm_client(sim800_modem);
+// GPRS credentials (leave empty, if missing)
+const char apn[] = "";      // Your APN
+const char gprsUser[] = ""; // User
+const char gprsPass[] = ""; // Password
+const char simPIN[] = "";   // SIM card PIN code, if any
+
+const char *token_auth = "b6a49b72-abd4-4d20-9175-b8a779e0d4e4";
+
+// mqtt part
+WiFiClient client;
+MQTTClient mqtt_client;
+StaticJsonDocument<200> mqtt_json;
+char mqtt_buffer[200];
+bool mqtt_connected = false;
+StaticJsonDocument<300> json_gps_tago;
+char gps_tago[300];
+bool gps_valid_or_not;
+uint32_t last_time_send_gps = 0;
+
+void callback_mqtt_message(String &topic, String &payload)
+{
+  debug_ser.print("[ ");
+  debug_ser.print("Topic: ");
+  debug_ser.print(topic);
+
+  debug_ser.print("  Payload: ");
+  debug_ser.print(payload);
+  debug_ser.println(" ]");
+
+  if (topic == "/esp32/cmd")
+  {
+    deserializeJson(mqtt_json, payload);
+  }
+}
+
+void connect_to_broker()
+{
+  mqtt_client.begin("mqtt.tago.io", gsm_client);
+  mqtt_client.onMessage(callback_mqtt_message);
+
+  while (!mqtt_client.connect("device_1", "Token", token_auth))
+  {
+    Serial.print(".");
+    delay(1000);
+  }
+
+  debug_ser.printf("[mqtt connected to mqtt.tago.io]\n");
+  mqtt_client.subscribe("/esp32/cmd");
+}
+
+void send_gps_to_tago_io()
+{
+  json_gps_tago[0]["variable"] = "location";
+  json_gps_tago["value"] = "Car Tracker";
+  json_gps_tago[0]["location"]["lat"] = lat_gps;
+  json_gps_tago[0]["location"]["lng"] = lng_gps;
+  auto count = serializeJson(json_gps_tago, gps_tago);
+  // publish
+  mqtt_client.publish("/esp32/car", gps_tago);
+}
+
+uint32_t last_time_report = 0;
+
+void send_location(const char *phone_number)
+{
+  char buffer_lat[64];
+  char buffer_lng[64];
+
+  Serial.printf("[send location to %s]\n", phone_number);
+  if (first_time_read_flag)
+  {
+    String text = "";
+    // https://www.google.com/maps/@32.0083304,14.5944372,8z
+    text += "There's car accident at https://www.google.com/maps/@";
+    text += dtostrf(lat_gps, 4, 4, buffer_lat);
+    text += ',';
+    text += dtostrf(lng_gps, 4, 4, buffer_lng);
+    text += ',';
+    text += "8z";
+    text += "";
+    Serial.printf("[Sending length - %d - %s\n]", text.length(), text.c_str());
+    sim800_modem.sendSMS(phone_number, text);
+  }
+}
+
+bool setupPMU()
+{
+  bool en = true;
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.beginTransmission(IP5306_ADDR);
+  Wire.write(IP5306_REG_SYS_CTL0);
+  if (en)
+  {
+    Wire.write(0x37); // Set bit1: 1 enable 0 disable boost keep on
+  }
+  else
+  {
+    Wire.write(0x35); // 0x37 is default reg value
+  }
+  return Wire.endTransmission() == 0;
+}
+
+void setup_sim800()
+{
+  pinMode(MODEM_RST, OUTPUT);
+  digitalWrite(MODEM_RST, HIGH);
+
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+
+  // turn on the modem power first
+  digitalWrite(MODEM_POWER_ON, HIGH);
+
+  // pull down PWRKEY for more than 1 second
+  // according to manual requirements
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+
+  sim800_serial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+}
+
+bool setup_sim800_internet()
+{
+  delay(100);
+
+  sim800_modem.restart();
+
+  delay(100);
+
+  // turning off light
+  debug_ser.println("[Turning off SIM800 Red LED...]");
+  sim800_modem.sendAT("+CNETLIGHT=0");
+
+  debug_ser.print("[Waiting for network...");
+  if (!sim800_modem.waitForNetwork(240000L))
+  {
+    debug_ser.println(" fail]");
+    delay(10000);
+    return false;
+  }
+
+  debug_ser.println(" OK]");
+
+  if (sim800_modem.isNetworkConnected())
+  {
+    debug_ser.println("[sim800 network connected]");
+  }
+
+  debug_ser.printf("[Connection to APN: %s\n", apn);
+  if (!sim800_modem.gprsConnect(apn, gprsUser, gprsPass))
+  {
+    debug_ser.println(" fail]");
+    delay(10000);
+    return false;
+  }
+
+  digitalWrite(LED_GPIO, LED_ON);
+  return true;
+}
+
+
+void setup()
+{
+  // put your setup code here, to run once:
+  debug_ser.begin(115200);
+
+  // block until you connect to wifi network
+  pinMode(13, OUTPUT);
+  setupPMU();
+  setup_sim800();
+  if (!setup_sim800_internet())
+  {
+    debug_ser.println("[failed to connect to the internet]");
+  }
+
+  debug_ser.println("[sim800l connected to the internet]\n");
+
+
+  // connect to broker
+  connect_to_broker();
+
+  digitalWrite(13, HIGH);
+
+  debug_ser.println("[sim800 is ready to use]");
+  // setup gps module
+  gps_serial.begin(9600, SERIAL_8N1, gps_rx_pin, gps_tx_pin);
+
+}
+
+void loop()
+{
+  // put your main code here, to run repeatedly:
+  // mqtt loop
+  mqtt_client.loop();
+
+  if (!mqtt_client.connected())
+  {
+    mqtt_connected = false;
+    connect_to_broker();
+  }
+
+  while (gps_serial.available() > 0)
+  {
+    if (gps.encode(gps_serial.read()))
+    {
+      if (gps.location.isValid())
+      {
+        first_time_read_flag = true;
+        lat_gps = gps.location.lat();
+        lng_gps = gps.location.lng();
+      }
+    }
+  }
+
+  // read parameters
+  if(millis() - last_time_report > 1000){
+    last_time_report = millis();
+    debug_ser.print("Lat: ");
+    debug_ser.print(lat_gps);
+    debug_ser.print(" Lng: ");
+    debug_ser.println(lng_gps);
+    // debug_ser.print(" Temperature: ");
+    // debug_ser.println(read_temperature());
+  }
+  
+  if(millis() - last_time_send_gps > 5000){
+    last_time_send_gps = millis();
+
+    if(first_time_read_flag){
+      Serial.println("[calling send_gps_to_tago_io]");
+      send_gps_to_tago_io();
+    }
+  }
+
+
+}
